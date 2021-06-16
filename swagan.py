@@ -11,6 +11,7 @@ from torch.autograd import Function
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
 from model import ModulatedConv2d, StyledConv, ConstantInput, PixelNorm, Upsample, Downsample, Blur, EqualLinear, ConvLayer
 
+num_channel = 1
 def get_haar_wavelet(in_channels):
     haar_wav_l = 1 / (2 ** 0.5) * torch.ones(1, 2)
     haar_wav_h = 1 / (2 ** 0.5) * torch.ones(1, 2)
@@ -99,14 +100,15 @@ class Generator(nn.Module):
         channel_multiplier=2,
         blur_kernel=[1, 3, 3, 1],
         lr_mlp=0.01,
+        num_channel = 1
     ):
         super().__init__()
 
-        self.size = size
+        self.size = size  #256
 
-        self.style_dim = style_dim
+        self.style_dim = style_dim  #512
 
-        layers = [PixelNorm()]
+        layers = [PixelNorm()]  #MLP Z ---> W
 
         for i in range(n_mlp):
             layers.append(
@@ -122,21 +124,21 @@ class Generator(nn.Module):
             8: 512,
             16: 512,
             32: 512,
-            64: 256 * channel_multiplier,
-            128: 128 * channel_multiplier,
-            256: 64 * channel_multiplier,
-            512: 32 * channel_multiplier,
-            1024: 16 * channel_multiplier,
+            64: 256 * channel_multiplier, #512
+            128: 128 * channel_multiplier, #256
+            256: 64 * channel_multiplier, #128
+            512: 32 * channel_multiplier, #64
+            1024: 16 * channel_multiplier, #32
         }
-
-        self.input = ConstantInput(self.channels[4])
+        
+        self.input = ConstantInput(self.channels[4])  #Input [n , 512]
         self.conv1 = StyledConv(
-            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
+            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel  #conv: 512 x 512 x 3
         )
         self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
 
-        self.log_size = int(math.log(size, 2)) - 1
-        self.num_layers = (self.log_size - 2) * 2 + 1
+        self.log_size = int(math.log(size, 2)) - 1   #7
+        self.num_layers = (self.log_size - 2) * 2 + 1  #11
 
         self.convs = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -147,12 +149,24 @@ class Generator(nn.Module):
 
         for layer_idx in range(self.num_layers):
             res = (layer_idx + 5) // 2
-            shape = [1, 1, 2 ** res, 2 ** res]
+            shape = [1, 1, 2 ** res, 2 ** res]           
             self.noises.register_buffer(f"noise_{layer_idx}", torch.randn(*shape))
+            '''
+            layer idx:  0 [1, 1, 4, 4]
+            layer idx:  1 [1, 1, 8, 8]
+            layer idx:  2 [1, 1, 8, 8]
+            layer idx:  3 [1, 1, 16, 16]
+            layer idx:  4 [1, 1, 16, 16]
+            layer idx:  5 [1, 1, 32, 32]
+            layer idx:  6 [1, 1, 32, 32]
+            layer idx:  7 [1, 1, 64, 64]
+            layer idx:  8 [1, 1, 64, 64]
+            layer idx:  9 [1, 1, 128, 128]
+            layer idx:  10 [1, 1, 128, 128]
+            '''
 
         for i in range(3, self.log_size + 1):
             out_channel = self.channels[2 ** i]
-
             self.convs.append(
                 StyledConv(
                     in_channel,
@@ -163,20 +177,26 @@ class Generator(nn.Module):
                     blur_kernel=blur_kernel,
                 )
             )
-
+            
             self.convs.append(
                 StyledConv(
                     out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel
                 )
             )
-
-            self.to_rgbs.append(ToRGB(out_channel, style_dim))
+            ''' 
+            i: 3 512, 512, 3, upsample=True ; 512, 512, 3, upsample=False
+            i: 4 512, 512, 3, upsample=True ; 512, 512, 3, upsample=False
+            i: 5 512, 512, 3, upsample=True ; 512, 512, 3, upsample=False
+            i: 6 512, 512, 3, upsample=True ; 512, 512, 3, upsample=False
+            i: 7 512, 256, 3, upsample=True ; 256, 256, 3, upsample=False
+            '''
+            self.to_rgbs.append(ToRGB(out_channel, style_dim)) #512, 12, 1, upsample=False
 
             in_channel = out_channel
 
         self.iwt = InverseHaarTransform(3)
 
-        self.n_latent = self.log_size * 2 - 2
+        self.n_latent = self.log_size * 2 - 2  #12
 
     def make_noise(self):
         device = self.input.input.device
@@ -199,7 +219,15 @@ class Generator(nn.Module):
 
     def get_latent(self, input):
         return self.style(input)
+    
+    def mean_latent(self, n_latent):
+        latent_in = torch.randn(
+            n_latent, self.style_dim, device=self.input.input.device
+        )
+        latent = self.style(latent_in).mean(0, keepdim=True)
 
+        return latent
+    
     def forward(
         self,
         styles,
@@ -211,12 +239,13 @@ class Generator(nn.Module):
         noise=None,
         randomize_noise=True,
     ):
-        if not input_is_latent:
+        #styles: 16 x 512
+        if not input_is_latent: 
             styles = [self.style(s) for s in styles]
 
         if noise is None:
             if randomize_noise:
-                noise = [None] * self.num_layers
+                noise = [None] * self.num_layers #11 layers
             else:
                 noise = [
                     getattr(self.noises, f"noise_{i}") for i in range(self.num_layers)
@@ -248,27 +277,46 @@ class Generator(nn.Module):
             latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
-            latent = torch.cat([latent, latent2], 1)
+            latent = torch.cat([latent, latent2], 1)  #16 x 12 x 512: 16 x 512: styles; 12 layers ; 16: batch size
 
         out = self.input(latent)
-        out = self.conv1(out, latent[:, 0], noise=noise[0])
+        out = self.conv1(out, latent[:, 0], noise=noise[0])  #16 x 512 x 4 x 4
 
-        skip = self.to_rgb1(out, latent[:, 1])
+        skip = self.to_rgb1(out, latent[:, 1])  #16 x 12 x 4 x 4
 
         i = 1
         for conv1, conv2, noise1, noise2, to_rgb in zip(
             self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
         ):
-            out = conv1(out, latent[:, i], noise=noise1)
-            out = conv2(out, latent[:, i + 1], noise=noise2)
-            skip = to_rgb(out, latent[:, i + 2], skip)
-
+            out = conv1(out, latent[:, i], noise=noise1) # [upsample] 
+            #print("out: ", out.shape, i)
+            out = conv2(out, latent[:, i + 1], noise=noise2) 
+            #print("out: ",out.shape, i)
+            skip = to_rgb(out, latent[:, i + 2], skip) 
+            #print("skip RGB: ",skip.shape, i)
             i += 2
+            '''
+            out:  torch.Size([16, 512, 8, 8]) 1
+            out:  torch.Size([16, 512, 8, 8]) 1
+            skip RGB:  torch.Size([16, 12, 8, 8]) 1
+            out:  torch.Size([16, 512, 16, 16]) 3
+            out:  torch.Size([16, 512, 16, 16]) 3
+            skip:  torch.Size([16, 12, 16, 16]) 3
+            out:  torch.Size([16, 512, 32, 32]) 5
+            out:  torch.Size([16, 512, 32, 32]) 5
+            skip:  torch.Size([16, 12, 32, 32]) 5
+            out:  torch.Size([16, 512, 64, 64]) 7
+            out:  torch.Size([16, 512, 64, 64]) 7
+            skip:  torch.Size([16, 12, 64, 64]) 7
+            out:  torch.Size([16, 256, 128, 128]) 9
+            out:  torch.Size([16, 256, 128, 128]) 9
+            skip:  torch.Size([16, 12, 128, 128]) 9
+            '''
 
-        image = self.iwt(skip)
-
+        image = self.iwt(skip) # torch.Size([16, 3, 256, 256])
+        #print(image.shape)
         if return_latents:
-            return image, latent
+            return image, latent # latent: torch.Size([16, 12, 512])
 
         else:
             return image, None
@@ -318,46 +366,54 @@ class FromRGB(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, size, channel_multiplier=2, blur_kernel=[1, 3, 3, 1]):
         super().__init__()
-
+        # size: 256
         channels = {
             4: 512,
             8: 512,
             16: 512,
             32: 512,
-            64: 256 * channel_multiplier,
-            128: 128 * channel_multiplier,
-            256: 64 * channel_multiplier,
-            512: 32 * channel_multiplier,
-            1024: 16 * channel_multiplier,
+            64: 256 * channel_multiplier, #512
+            128: 128 * channel_multiplier, #256
+            256: 64 * channel_multiplier, #128
+            512: 32 * channel_multiplier, #64
+            1024: 16 * channel_multiplier, #32
         }
-
+        
         self.dwt = HaarTransform(3)
 
         self.from_rgbs = nn.ModuleList()
         self.convs = nn.ModuleList()
 
-        log_size = int(math.log(size, 2)) - 1
+        log_size = int(math.log(size, 2)) - 1  #7
 
-        in_channel = channels[size]
+        in_channel = channels[size]  #512
 
-        for i in range(log_size, 2, -1):
+        for i in range(log_size, 2, -1): #7,6,5,4,3
             out_channel = channels[2 ** (i - 1)]
 
             self.from_rgbs.append(FromRGB(in_channel, downsample=i != log_size))
             self.convs.append(ConvBlock(in_channel, out_channel, blur_kernel))
-
+            
             in_channel = out_channel
+            '''
+            i: 7 RGB:12, 128, 1                Conv: 128, 128, 3 ; 128, 512, 3
+            i: 6 RGB:12, 512, 1  downsample    Conv: 512, 512, 3; 512, 512, 3
+            i: 5 RGB:12, 512, 1 downsample     Conv: 512, 512, 3; 512, 512, 3
+            i: 4 RGB:12, 512, 1 downsample     Conv: 512, 512, 3; 512, 512, 3
+            i: 3 RGB:12, 512, 1 downsample     Conv: 512, 512, 3; 512, 512, 3
+            '''
 
         self.from_rgbs.append(FromRGB(channels[4]))
 
         self.stddev_group = 4
         self.stddev_feat = 1
 
-        self.final_conv = ConvLayer(in_channel + 1, channels[4], 3)
+        self.final_conv = ConvLayer(in_channel + 1, channels[4], 3)  #513 512 3
         self.final_linear = nn.Sequential(
-            EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
-            EqualLinear(channels[4], 1),
+            EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),  #8192 , 512
+            EqualLinear(channels[4], 1),  # 512, 1
         )
+        
 
     def forward(self, input):
         input = self.dwt(input)

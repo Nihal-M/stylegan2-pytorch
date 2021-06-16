@@ -11,15 +11,9 @@ from torch.utils import data
 import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
-
-try:
-    import wandb
-
-except ImportError:
-    wandb = None
-
-
+import wandb
 from dataset import MultiResolutionDataset
+from dataset import XRayDataset
 from distributed import (
     get_rank,
     synchronize,
@@ -27,9 +21,9 @@ from distributed import (
     reduce_sum,
     get_world_size,
 )
+import pdb
 from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
-
 
 def data_sampler(dataset, shuffle, distributed):
     if distributed:
@@ -123,9 +117,8 @@ def set_grad_none(model, targets):
             p.grad = None
 
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, save_dir):
     loader = sample_data(loader)
-
     pbar = range(args.iter)
 
     if get_rank() == 0:
@@ -155,9 +148,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
-
+    
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
-
+    
     for idx in pbar:
         i = idx + args.start_iter
 
@@ -168,6 +161,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         real_img = next(loader)
         real_img = real_img.to(device)
+        
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
@@ -308,13 +302,13 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     sample, _ = g_ema([sample_z])
                     utils.save_image(
                         sample,
-                        f"sample/{str(i).zfill(6)}.png",
+                        save_dir+f"sample/{str(i).zfill(6)}.png",
                         nrow=int(args.n_sample ** 0.5),
                         normalize=True,
-                        range=(-1, 1),
+                        range=(0, 1),
                     )
 
-            if i % 10000 == 0:
+            if i % 5000 == 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -325,17 +319,17 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         "args": args,
                         "ada_aug_p": ada_aug_p,
                     },
-                    f"checkpoint/{str(i).zfill(6)}.pt",
+                    save_dir+f"checkpoint/{str(i).zfill(6)}.pt",
                 )
 
 
 if __name__ == "__main__":
     device = "cuda"
-
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("path", type=str, help="path to the lmdb dataset")
-    parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
+    parser.add_argument("path", default = '/ocean/projects/asc170022p/singla/Datasets/MIMIC-CXR/PA_AP_views_image_report.csv',type=str, help="path to the lmdb dataset")
+    parser.add_argument('--save_dir', type=str, default='/ocean/projects/asc170022p/singla/MIMICCX-Chest-Explainer/stylegan2-pytorch/Experiment_MIMIC_CXR/Run2/', help='')
+    parser.add_argument('--arch', type=str, default='swagan', help='model architectures (stylegan2 | swagan)')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
@@ -384,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ckpt",
         type=str,
-        default=None,
+        default='/ocean/projects/asc170022p/singla/MIMICCX-Chest-Explainer/stylegan2-pytorch/Experiment_MIMIC_CXR/Run1/checkpoint/030000.pt',
         help="path to the checkpoints to resume training",
     )
     parser.add_argument("--lr", type=float, default=0.002, help="learning rate")
@@ -412,7 +406,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ada_target",
         type=float,
-        default=0.6,
+        default=0.3,
         help="target augmentation probability for adaptive augmentation",
     )
     parser.add_argument(
@@ -429,17 +423,22 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
-    n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+    n_gpu = torch.cuda.device_count()
+    #n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+    print("n_gpu: ",n_gpu)
     args.distributed = n_gpu > 1
-
+    print("args.distributed: ",args.distributed)
     if args.distributed:
+        for i in range(n_gpu):
+            print(torch.cuda.get_device_name(device=i))
+            print(torch.cuda.get_device_properties(i))
+        print("args.local_rank: ",args.local_rank)
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
 
     args.latent = 512
-    args.n_mlp = 8
+    args.n_mlp = 8  #Number for MLP for Z --> W
 
     args.start_iter = 0
 
@@ -511,13 +510,14 @@ if __name__ == "__main__":
 
     transform = transforms.Compose(
         [
-            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
         ]
     )
 
-    dataset = MultiResolutionDataset(args.path, transform, args.size)
+    #dataset = MultiResolutionDataset(args.path, transform, args.size)
+    #for chest xray
+    dataset = XRayDataset(args.path, args.size)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
@@ -528,4 +528,4 @@ if __name__ == "__main__":
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
 
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, save_dir = args.save_dir)
